@@ -1,1 +1,3 @@
 tinycomp
+/venv/
+*.pyc
