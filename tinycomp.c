@@ -240,7 +240,6 @@ int main() {
     WINDOW *cmd_win = newwin(input_height, width, mem_height + stack_height, 0);
 
     scrollok(cmd_win, TRUE);
-    box(cmd_win, 0, 0);
 
     init_memory();
     draw_memory(mem_win);
@@ -248,8 +247,9 @@ int main() {
 
     char input[256];
     while (1) {
+        werase(cmd_win);
+        box(cmd_win, 0, 0);
         mvwprintw(cmd_win, 1, 2, ">>> ");
-        wclrtoeol(cmd_win);
         wrefresh(cmd_win);
         wgetnstr(cmd_win, input, sizeof(input) - 1);
         to_upper(input);
