@@ -1,5 +1,22 @@
 import re
 import operator
+from collections import defaultdict
+from typing import List, Tuple
+
+MAX_I16 = 32767
+
+def i16(i):
+    """Clamp an integer to 16-bit 2's complement values
+
+        >>> i16(2 ** 16)
+        0
+
+        >>> i16(-1)
+        -1
+
+    """
+    i = i % (2 ** 16)
+    return i - 2 ** 16 if i > MAX_I16 else i
 
 # Value Types:
 # Raw, instruction, number, character, pointer.
@@ -26,6 +43,7 @@ VT_SIZE = {
 }
 
 ANSI_RESET = '\x1b[0m'
+ANSI_NOBYTE = '\x1b[37m'
 VT_ANSI = {
     VT_RAW:  '\x1b[38m',
     VT_INST: '\x1b[31m',
@@ -35,32 +53,12 @@ VT_ANSI = {
 }
 
 
-def test1():
-    mem = TinyMemory(256)
-    mem.set8(0, 32, VT_RAW)
-    mem.set16(2, 32, VT_INST)
-    mem.set16(4, 32, VT_NUM)
-    mem.set16(6, 16, VT_PTR)
-    mem.setstr(16, 'Hello!')
-    mem.dump()
+ASM_TOKEN_REGEX = re.compile(r'\s*("(?:[^"]|\\")*"|;.*|\S+)\s*')
+ASM_LABEL_REGEX = re.compile(r'[_a-zA-Z][_a-zA-Z0-9]*')
 
 
-def test2():
-    mem = TinyMemory(256)
-    i = 0
-    for part in """
-        A= &0x20
-        B= 10
-        :A=B
-        HALT
-    """.split():
-        val, vt = value_parse(part)
-        mem.set16(i, val, vt)
-        i += VT_SIZE[vt]
-    proc = TinyProcessor(mem)
-    proc.run()
-    proc.dump()
-    mem.dump()
+class TinyAsmParseError(Exception):
+    """Error in parse_asm()"""
 
 
 def vtype_repr(vtype: int) -> str:
@@ -76,31 +74,157 @@ def inst_parse(s: str) -> int:
         return None
     return INSTRUCTIONS.index(s)
 
-def value_parse(s: str):
-    if s in INSTRUCTIONS:
-        return INSTRUCTIONS.index(s), VT_INST
-    elif s.isdigit():
-        return int(s), VT_NUM
-    elif s.startswith('0x'):
-        return int(s[2:], 16), VT_NUM
-    elif s.startswith('&'):
-        s = s[1:]
-        if s.isdigit():
-            return int(s), VT_PTR
-        elif s.startswith('0x'):
-            return int(s[2:], 16), VT_PTR
-        else:
-            raise Exception(f"Cannot parse: {s!r}")
-    elif s.startswith('c'):
-        s = s[1:]
-        if s.isdigit():
-            return int(s), VT_CHR
-        elif s.startswith('0x'):
-            return int(s[2:], 16), VT_CHR
-        else:
-            raise Exception(f"Cannot parse: {s!r}")
-    else:
-        raise Exception(f"Cannot parse: {s!r}")
+def parse_asm(text: str, filename=None) -> Tuple[List[int], List[int]]:
+    """
+
+        >>> values, vtypes = parse_asm('''
+        ...     ; I am a comment!
+        ...     %define x 100
+        ...     JMP main
+        ...
+        ...     main:
+        ...     _start:
+        ...     JNE _start
+        ...     JMP _end
+        ...     _end:
+        ...
+        ...     f:
+        ...     _start:
+        ...     JNE _start
+        ...     JMP _end
+        ...     _end:
+        ...
+        ...     data: x -99 0xFF &0xff "hello world!"
+        ... ''')
+        >>> for val, vt in zip(values, vtypes):
+        ...     print(value_dump(val, vt, ansi=False))
+        JMP
+        &0004
+        JNE
+        &0004
+        JMP
+        &000c
+        JNE
+        &000c
+        JMP
+        &0014
+        100
+        -99
+        ff
+        &00ff
+        h
+        e
+        l
+        l
+        o
+        <BLANKLINE>
+        w
+        o
+        r
+        l
+        d
+        !
+
+    """
+    values = []
+    vtypes = []
+    defines = {}
+    labels = {}
+    replacements = defaultdict(list)
+    def add(value, vtype):
+        values.append(value)
+        vtypes.append(vtype)
+    def get_ptr():
+        return sum(VT_SIZE[vt] for vt in vtypes)
+    def do_replacements(label):
+        ptr = get_ptr()
+        if label in replacements:
+            for i in replacements[label]:
+                values[i] = ptr
+            del replacements[label]
+    for line_i, line in enumerate(text.splitlines()):
+        token = None
+        try:
+            tokens = (m.group(1) for m in ASM_TOKEN_REGEX.finditer(line))
+            for token in tokens:
+
+                # Reference to a definition
+                if token in defines:
+                    token = defines[token]
+
+                if token in INSTRUCTIONS:
+                    add(INSTRUCTIONS.index(token), VT_INST)
+                elif token == '%define':
+                    name = next(tokens)
+                    defines[name] = next(tokens)
+                elif token == '%include':
+                    sub_filename = next(tokens)
+                    sub_values, sub_vtypes = parse_asm(
+                        open(sub_filename, 'r').read(),
+                        sub_filename)
+                    values += sub_values
+                    vtypes += sub_vtypes
+                elif token[0] == ';':
+                    # Comment
+                    pass
+                elif token[-1:] == ':':
+                    # Defining a label
+                    label = token[:-1]
+                    if not ASM_LABEL_REGEX.fullmatch(label):
+                        raise Exception(f"Invalid label: {label!r}")
+                    if label in labels:
+                        raise Exception(f"Duplicate label: {label!r}")
+                    if label[0] != '_':
+                        # Whenever we define a new "public label", we remove
+                        # all "private labels", i.e. underscore-prefixed ones.
+                        # Think of public labels as C functions, and private
+                        # labels as C labels within a function.
+                        ll = [l for l in labels if l.startswith('_')]
+                        bad_ll = [l for l in ll if l in replacements]
+                        if bad_ll:
+                            raise Exception(f"Labels left undefined: {', '.join(bad_ll)}")
+                        for l in ll:
+                            del labels[l]
+                    do_replacements(label)
+                    labels[label] = get_ptr()
+                elif ASM_LABEL_REGEX.fullmatch(token):
+                    # Referring to a label
+                    label = token
+                    if label in labels:
+                        add(labels[label], VT_PTR)
+                    else:
+                        replacements[label].append(len(values))
+                        add(0, VT_PTR)
+                elif token.startswith('0x'):
+                    add(int(token[2:], 16), VT_RAW)
+                elif token[0] == '-' or token[0].isdigit():
+                    add(int(token), VT_NUM)
+                elif token.startswith('&'):
+                    if token[1:3] != '0x':
+                        raise Exception("Pointer literals should start with '&0x'")
+                    add(int(token[3:], 16), VT_PTR)
+                elif token.startswith('"'):
+                    bslash = False
+                    for c in token[1:-1]:
+                        if bslash:
+                            if c == 'n':
+                                c = '\n'
+                            add(ord(c), VT_CHR)
+                            bslash = False
+                        elif c == '\\':
+                            bslash = True
+                        else:
+                            add(ord(c), VT_CHR)
+                else:
+                    raise Exception(f"Cannot parse: {token!r}")
+        except Exception as ex:
+            msg = f"Parsing token {token!r} at line {line_i + 1}: {ex}"
+            if filename:
+                msg = f"In {filename}: {msg}"
+            raise TinyAsmParseError(msg)
+    if replacements:
+        raise Exception(f"Labels left undefined: {', '.join(replacements)}")
+    return values, vtypes
 
 def value_dump(value, vtype, *, ansi=True, just=False) -> str:
     vsize = VT_SIZE[vtype]
@@ -118,7 +242,7 @@ def value_dump(value, vtype, *, ansi=True, just=False) -> str:
         else:
             s = '.'
     elif vtype == VT_PTR:
-        s = hex(value)[2:].rjust(4, '0')
+        s = '&' + hex(value)[2:].rjust(4, '0')
     else:
         raise Exception(f"Unexpected vtype: {vtype_repr(vtype)}")
     if just:
@@ -182,11 +306,94 @@ JUMP_INSTRUCTIONS_ACCEPTED_CMP = {
 
 
 class TinyMemory:
+    """
+
+        >>> mem = TinyMemory(16 * 4)
+        >>> mem.set8(0, 32, VT_RAW)
+        >>> mem.set16(2, 32, VT_INST) # IO=B
+        >>> mem.set16(4, 32, VT_NUM)
+        >>> mem.set16(6, 16, VT_PTR)
+        >>> mem.setstr(16, 'Hello!')
+        >>> mem.dump(ansi=False, bars=True)
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+        0000 |20|00| IO=B|   32|&0010|00|00|00|00|00|00|00|00|
+        0010 | H| e| l| l| o| !|00|00|00|00|00|00|00|00|00|00|
+        0020 |00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|
+        0030 |00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+        >>> mem.dump(ansi=False, bars=True, raw=True)
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+        0000 |20|00|00|20|00|20|00|10|00|00|00|00|00|00|00|00|
+        0010 |48|65|6c|6c|6f|21|00|00|00|00|00|00|00|00|00|00|
+        0020 |00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|
+        0030 |00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
+        >>> from io import BytesIO
+        >>> file = BytesIO()
+        >>> mem.save(file)
+        >>> file.seek(0)
+        0
+        >>> mem2 = TinyMemory.load(file)
+        >>> mem == mem2
+        True
+
+    """
 
     def __init__(self, size):
         self.size = size
         self.values = [0] * size
         self.vtypes = [VT_RAW] * size
+
+    def __eq__(self, other):
+        return self.values == other.values and self.vtypes == other.vtypes
+
+    def write_values(self, i, values, vtypes):
+        size = len(values)
+        if size != len(vtypes):
+            raise Exception("Length of values and vtypes must match")
+        for value, vtype in zip(values, vtypes):
+            self.set(i, value, vtype)
+            i += VT_SIZE[vtype]
+
+    def save(self, file):
+        if isinstance(file, str):
+            file = open(file, 'wb')
+        parts = []
+        for value, vtype in zip(self.values, self.vtypes):
+            word = vtype * 256 + value
+            parts.append(word.to_bytes(2, 'big'))
+        data = b''.join(parts)
+        file.write(data)
+
+    @staticmethod
+    def load_asm(file, size=None):
+        if isinstance(file, str):
+            filename = file
+            file = open(file, 'r')
+        else:
+            filename = None
+        values, vtypes = parse_asm(file.read(), filename)
+        if size is None:
+            size = sum(VT_SIZE[vt] for vt in vtypes)
+        self = TinyMemory(size)
+        self.write_values(0, values, vtypes)
+        return self
+
+    @staticmethod
+    def load(file):
+        if isinstance(file, str):
+            file = open(file, 'rb')
+        data = file.read()
+        size = len(data) // 2
+        self = TinyMemory(size)
+        for i in range(size):
+            word = int.from_bytes(data[i*2:i*2+2], 'big')
+            vtype = word // 256
+            value = word % 256
+            self.values[i] = value
+            self.vtypes[i] = vtype
+        return self
 
     def get(self, i):
         vtype = self.vtypes[i]
@@ -199,7 +406,11 @@ class TinyMemory:
         return self.values[i], self.vtypes[i]
 
     def get16(self, i):
-        return self.values[i] * 256 + self.values[i + 1], self.vtypes[i]
+        vtype = self.vtypes[i]
+        value = self.values[i] * 256 + self.values[i + 1]
+        if vtype == VT_NUM:
+            value = i16(value)
+        return value, vtype
 
     def set(self, i, value, vtype):
         if VT_SIZE[vtype] == 2:
@@ -232,32 +443,73 @@ class TinyMemory:
             self.set8(i, value, VT_CHR)
             i += 1
 
-    def dump(self, i=0, *, w=16, h=16, file=None):
-        max_j = i + (h - 1) * w + (w - 1)
-        if i < 0 or max_j >= self.size:
-            raise Exception(f"Out of range: i={i} w={w} h={h} max_j={max_j} size={self.size}")
-
+    def dump(self, i=0, *, w=16, h=16, ansi=True, file=None, bars=False, raw=False):
+        space = '|' if bars else ' '
+        hbar = '     +' + '--+' * w
         skip = 0
+        print(hbar, file=file)
         for y in range(h):
             y_ptr = i + y * w
-            print(f'{value_dump(y_ptr, VT_PTR)} | ', end='', file=file)
+            if y_ptr >= self.size:
+                break
+            y_ptr_s = value_dump(y_ptr, VT_PTR, ansi=ansi).replace('&', '')
+            print(f'{y_ptr_s} |', end='', file=file)
             for x in range(w):
                 if skip > 0:
                     skip -= 1
-                    #print(' ' * 2, end='', file=file)
                     continue
-                j = y_ptr + x
-                value, vtype = self.get(j)
-                value_str = value_dump(value, vtype, just=True)
-                vsize = VT_SIZE[vtype]
                 if x > 0:
-                    value_str = ' ' + value_str
+                    print(space, end='', file=file)
+                j = y_ptr + x
+                if j >= self.size:
+                    value_str = '##'
+                    if ansi:
+                        value_str = f'{ANSI_NOBYTE}{value_str}{ANSI_RESET}'
+                    print(value_str, end='', file=file)
+                    continue
+                if raw:
+                    value = self.values[j]
+                    vtype = VT_RAW
+                else:
+                    value, vtype = self.get(j)
+                value_str = value_dump(value, vtype, ansi=ansi, just=True)
                 print(value_str, end='', file=file)
+                vsize = VT_SIZE[vtype]
                 skip = vsize - 1
-            print(file=file)
+            print('|', file=file)
+        print(hbar, file=file)
 
 
 class TinyProcessor:
+    """
+
+        >>> values, vtypes = parse_asm('''
+        ...     A= &0x20
+        ...     B= 10
+        ...     :A=B
+        ...     HALT
+        ... ''')
+
+        >>> mem = TinyMemory(16 * 4)
+        >>> mem.write_values(0, values, vtypes)
+        >>> proc = TinyProcessor(mem)
+        >>> proc.run()
+        >>> proc.dump(ansi=False)
+        A=&0020
+        B=10
+        C=00
+        D=00
+        PC=&000a
+        CMP=0
+        >>> mem.dump(ansi=False)
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+        0000 |   A= &0020    B=    10  :A=B  HALT 00 00 00 00|
+        0010 |00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00|
+        0020 |   10 00 00 00 00 00 00 00 00 00 00 00 00 00 00|
+        0030 |00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00|
+             +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+
+    """
 
     def __init__(self, mem: TinyMemory):
         self.mem = mem
@@ -269,12 +521,12 @@ class TinyProcessor:
         self.pc = 0
         self.cmp_flag = 0
 
-    def dump(self, *, file=None):
+    def dump(self, *, ansi=True, file=None):
         for reg in REGISTERS:
             value = self.reg_values[reg]
             vtype = self.reg_vtypes[reg]
-            print(f'{reg}={value_dump(value, vtype)}', file=file)
-        print(f'PC={value_dump(self.pc, VT_PTR)}', file=file)
+            print(f'{reg}={value_dump(value, vtype, ansi=ansi)}', file=file)
+        print(f'PC={value_dump(self.pc, VT_PTR, ansi=ansi)}', file=file)
         print(f'CMP={self.cmp_flag}', file=file)
 
     def step(self):
