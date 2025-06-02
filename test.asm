@@ -1,12 +1,13 @@
 JMP main
 
-%define callstack_size 10
 "STK:"
+%define callstack_size 10
 callstack: %zeros callstack_size
 %macro CALL :D=PC :D+ 10 JMP
 %macro RET PC=:D
 
-"PL:" printline:
+"PL:"
+printline:
 _start:
 .A? "\0"
 JE _done
