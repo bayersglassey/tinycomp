@@ -1,5 +1,7 @@
 import re
+import sys
 import operator
+from argparse import ArgumentParser
 from collections import defaultdict
 from typing import List, Tuple
 
@@ -60,6 +62,9 @@ ASM_LABEL_REGEX = re.compile(r'[_a-zA-Z][_a-zA-Z0-9]*')
 class TinyAsmParseError(Exception):
     """Error in parse_asm()"""
 
+
+def vsize_sum(vtypes) -> int:
+    return sum(VT_SIZE[vt] for vt in vtypes)
 
 def vtype_repr(vtype: int) -> str:
     return VT_NAME.get(vtype, f'<unknown vtype: {vtype!r}>')
@@ -135,7 +140,7 @@ def parse_asm(text: str, filename=None) -> Tuple[List[int], List[int]]:
         values.append(value)
         vtypes.append(vtype)
     def get_ptr():
-        return sum(VT_SIZE[vt] for vt in vtypes)
+        return vsize_sum(vtypes)
     def do_replacements(label):
         ptr = get_ptr()
         if label in replacements:
@@ -368,21 +373,26 @@ class TinyMemory:
 
     @staticmethod
     def load_asm(file, size=None):
-        if isinstance(file, str):
+        if file == '-':
+            filename = '<STDIN>'
+            file = sys.stdin
+        elif isinstance(file, str):
             filename = file
             file = open(file, 'r')
         else:
             filename = None
         values, vtypes = parse_asm(file.read(), filename)
         if size is None:
-            size = sum(VT_SIZE[vt] for vt in vtypes)
+            size = vsize_sum(vtypes)
         self = TinyMemory(size)
         self.write_values(0, values, vtypes)
         return self
 
     @staticmethod
     def load(file):
-        if isinstance(file, str):
+        if file == '-':
+            file = sys.stdin
+        elif isinstance(file, str):
             file = open(file, 'rb')
         data = file.read()
         size = len(data) // 2
@@ -616,3 +626,34 @@ class TinyProcessor:
             raise Exception("I/O not implemented yet")
         else:
             raise Exception(f"Unrecognized arg: {arg}")
+
+
+def parse_cli_args():
+    parser = ArgumentParser()
+    parser.add_argument('--file', '-f', required=True)
+    parser.add_argument('--mem', '-m', default=False, action='store_true')
+    parser.add_argument('--run', '-r', default=False, action='store_true')
+    parser.add_argument('--ansi', default=True, action='store_false')
+    parser.add_argument('--bars', default=False, action='store_true')
+    parser.add_argument('--raw', default=False, action='store_true')
+    return parser.parse_args()
+
+
+def main(args=None):
+    if args is None:
+        args = parse_cli_args()
+    if args.mem:
+        mem = TinyMemory.load(args.file)
+        proc = None
+    else:
+        mem = TinyMemory.load_asm(args.file)
+        proc = TinyProcessor(mem)
+    if args.run:
+        proc.run()
+    if proc is not None:
+        proc.dump(ansi=args.ansi)
+    mem.dump(ansi=args.ansi, bars=args.bars, raw=args.raw)
+
+
+if __name__ == '__main__':
+    main()
