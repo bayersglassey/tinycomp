@@ -72,6 +72,7 @@ KEYWORDS = (
     'for',
     'struct',
     'union',
+    'typedef',
 )
 
 TOKEN_PATTERNS = {
@@ -148,33 +149,61 @@ def tokenize(text: str, filename: str = '<NO FILE>') -> List[Token]:
     )
 
 class TokenIterator:
+    """
+
+        >>> it = TokenIterator(tokenize('1 + 2'))
+        >>> it.get_next()
+        ('num', '1')
+        >>> it.get_next()
+        ('op', '+')
+        >>> with it: raise Exception("BOOM!")
+        Traceback (most recent call last):
+         ...
+        tinc.ParseError: In file <NO FILE>, row 1, col 3 ('+'): BOOM!
+
+        >>> it.get_next()
+        ('num', '2')
+        >>> it.unget()
+        >>> with it: raise Exception("BOOM!")
+        Traceback (most recent call last):
+         ...
+        tinc.ParseError: In file <NO FILE>, row 1, col 5 ('2'): BOOM!
+
+        >>> it.get_next()
+        ('num', '2')
+
+    """
 
     def __init__(self, tokens):
         self.tokens = list(tokens)
-        self.tokens.reverse()
-        self.prev_token = None
+        self.n_tokens = len(self.tokens)
+        self.i = 0
+        self.i2 = 0
 
     def __enter__(self):
         return self
 
     def __exit__(self, ex_type, ex, tb):
-        if ex is not None:
-            err_token = self.prev_token
-            if err_token is not None:
-                raise ParseError(f"In file {err_token.filename}, row {err_token.col}, col {err_token.col}: {ex}")
+        if ex is not None and not isinstance(ex, ParseError):
+            prev_i = self.i2 - 1
+            if prev_i >= 0 and prev_i < self.n_tokens:
+                err_token = self.tokens[prev_i]
+                raise ParseError(f"In file {err_token.filename}, row {err_token.row}, col {err_token.col} ({err_token.token!r}): {ex}")
+            else:
+                raise ParseError(f"In ???: {ex}")
 
     def get_next(self):
-        if not self.tokens:
+        if self.i >= self.n_tokens:
             raise Exception("End of file!")
-        token = self.tokens.pop()
-        self.prev_token = token
+        token = self.tokens[self.i]
+        self.i += 1
+        self.i2 = self.i
         return token.toktype, token.token
 
     def unget(self):
-        if self.prev_token is None:
+        if self.i <= 0:
             raise IndexError
-        self.tokens.append(self.prev_token)
-        self.prev_token = None
+        self.i -= 1
 
 
 def parse_expr(tokens, prev_prec: int = None):
@@ -185,6 +214,11 @@ def parse_expr(tokens, prev_prec: int = None):
 
         >>> test(')')
         None
+
+        >>> test('1 + (2 + #define)')
+        Traceback (most recent call last):
+         ...
+        tinc.ParseError: In file <NO FILE>, row 1, col 10 ('#define'): Expected an expression
 
         >>> test('1 + 2 + 3')
         ('binop',
@@ -222,7 +256,7 @@ def parse_expr(tokens, prev_prec: int = None):
     def expect(expected):
         toktype, token = tokens.get_next()
         if token != expected:
-            raise Exception(f"Expected {expected!r}, got: {token!r}")
+            raise Exception(f"Expected {expected!r}")
     if not isinstance(tokens, TokenIterator):
         tokens = TokenIterator(tokens)
     with tokens:
@@ -326,7 +360,7 @@ def parse_decl(tokens):
     def expect(expected):
         toktype, token = tokens.get_next()
         if token != expected:
-            raise Exception(f"Expected {expected!r}, got: {token!r}")
+            raise Exception(f"Expected {expected!r}")
     if not isinstance(tokens, TokenIterator):
         tokens = TokenIterator(tokens)
     with tokens:
@@ -337,7 +371,7 @@ def parse_decl(tokens):
             prev_token = token
             toktype, token = tokens.get_next()
             if toktype != 'name':
-                raise Exception("Expected a name, got: {token!r}")
+                raise Exception("Expected a name")
             decl_type = (prev_token, token)
         else:
             tokens.unget()
@@ -354,7 +388,7 @@ def parse_decl(tokens):
 
         toktype, token = tokens.get_next()
         if toktype != 'name':
-            raise Exception("Expected a name, got: {token!r}")
+            raise Exception("Expected a name")
         name = token
 
         for i in range(ptr_depth):
@@ -364,7 +398,7 @@ def parse_decl(tokens):
         if token == '[':
             toktype, token = tokens.get_next()
             if toktype != 'num':
-                raise Exception("Expected a number, got: {token!r}")
+                raise Exception("Expected a number")
             index = int(token)
             expect(']')
             decl_type = ('array', index, decl_type)
@@ -385,7 +419,7 @@ def parse_statement(tokens):
         >>> test('1 + 2')
         Traceback (most recent call last):
          ...
-        tinc.ParseError: In file <NO FILE>, row 6, col 6: Expected ';', got: ''
+        tinc.ParseError: In file <NO FILE>, row 1, col 6 (''): Expected ';'
 
         >>> test('1 + 2;')
         ('expr', ('binop', 'add', ('atom', 'num', '1'), ('atom', 'num', '2')))
@@ -421,7 +455,7 @@ def parse_statement(tokens):
     def expect(expected):
         toktype, token = tokens.get_next()
         if token != expected:
-            raise Exception(f"Expected {expected!r}, got: {token!r}")
+            raise Exception(f"Expected {expected!r}")
     if not isinstance(tokens, TokenIterator):
         tokens = TokenIterator(tokens)
     with tokens:
