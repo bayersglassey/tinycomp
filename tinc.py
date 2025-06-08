@@ -61,6 +61,7 @@ OPS = (
 OPS_BY_NAME = {op.name: op for op in OPS}
 UNOPS_BY_TOKEN = {op.token: op for op in OPS if op.arity == UNARY_OP}
 BINOPS_BY_TOKEN = {op.token: op for op in OPS if op.arity == BINARY_OP}
+DECL_OPS = {'deref'}
 
 KEYWORDS = (
     'if',
@@ -72,6 +73,7 @@ KEYWORDS = (
     'for',
     'struct',
     'union',
+    'enum',
     'typedef',
 )
 
@@ -206,328 +208,443 @@ class TokenIterator:
         self.i -= 1
 
 
-def parse_expr(tokens, prev_prec: int = None):
-    """Parse an expression.
-
-        >>> from pprint import pprint
-        >>> test = lambda text: pprint(parse_expr(tokenize(text)))
-
-        >>> test(')')
-        None
-
-        >>> test('1 + (2 + #define)')
-        Traceback (most recent call last):
-         ...
-        tinc.ParseError: In file <NO FILE>, row 1, col 10 ('#define'): Expected an expression
-
-        >>> test('1 + 2 + 3')
-        ('binop',
-         'add',
-         ('binop', 'add', ('atom', 'num', '1'), ('atom', 'num', '2')),
-         ('atom', 'num', '3'))
-
-        >>> test('1 * 2 + 3')
-        ('binop',
-         'add',
-         ('binop', 'mul', ('atom', 'num', '1'), ('atom', 'num', '2')),
-         ('atom', 'num', '3'))
-
-        >>> test('1 + 2 * 3')
-        ('binop',
-         'add',
-         ('atom', 'num', '1'),
-         ('binop', 'mul', ('atom', 'num', '2'), ('atom', 'num', '3')))
-
-        >>> test('(1 * - 2) + f(3, 4)[5]')
-        ('binop',
-         'add',
-         ('binop', 'mul', ('atom', 'num', '1'), ('unop', 'neg', ('atom', 'num', '2'))),
-         ('index',
-          ('call', ('atom', 'name', 'f'), [('atom', 'num', '3'), ('atom', 'num', '4')]),
-          ('atom', 'num', '5')))
-
-        >>> test('{10, 20, 30}[i]')
-        ('index',
-         ('array',
-          [('atom', 'num', '10'), ('atom', 'num', '20'), ('atom', 'num', '30')]),
-         ('atom', 'name', 'i'))
-
-    """
-    def expect(expected):
-        toktype, token = tokens.get_next()
-        if token != expected:
-            raise Exception(f"Expected {expected!r}")
-    if not isinstance(tokens, TokenIterator):
-        tokens = TokenIterator(tokens)
-    with tokens:
-        toktype, token = tokens.get_next()
-        if toktype == 'op':
-            op = UNOPS_BY_TOKEN.get(token)
-            if op is None:
-                raise Exception(f"Not a unary operator: {token!r}")
-            child = parse_expr(tokens, op.prec)
-            if child is None:
-                raise Exception("Expected an expression")
-            lhs = ('unop', op.name, child)
-        elif token == '(':
-            child = parse_expr(tokens)
-            if child is None:
-                raise Exception("Expected an expression")
-            expect(')')
-            lhs = child
-        elif token == '{':
-            children = []
-            while True:
-                child = parse_expr(tokens)
-                if child is None:
-                    break
-                children.append(child)
-                toktype, token = tokens.get_next()
-                if token != ',':
-                    tokens.unget()
-                    break
-            expect('}')
-            lhs = ('array', children)
-        elif toktype in ('name', 'num', 'hex', 'ptr', 'str'):
-            lhs = ('atom', toktype, token)
-        else:
-            tokens.unget()
-            return None
-
-        while True:
-            toktype, token = tokens.get_next()
-            if toktype == 'op':
-                op = BINOPS_BY_TOKEN.get(token)
-                if op is None:
-                    raise Exception(f"Not a binary operator: {token!r}")
-                if prev_prec is not None and op.prec >= prev_prec:
-                    tokens.unget()
-                    break
-                rhs = parse_expr(tokens, op.prec)
-                if rhs is None:
-                    raise Exception("Expected an expression")
-                lhs = ('binop', op.name, lhs, rhs)
-            elif token == '(':
-                args = []
-                while True:
-                    arg = parse_expr(tokens)
-                    if arg is None:
-                        break
-                    args.append(arg)
-                    toktype, token = tokens.get_next()
-                    if token != ',':
-                        tokens.unget()
-                        break
-                expect(')')
-                lhs = ('call', lhs, args)
-            elif token == '[':
-                rhs = parse_expr(tokens)
-                if rhs is None:
-                    raise Exception("Expected an expression")
-                expect(']')
-                lhs = ('index', lhs, rhs)
-            else:
-                tokens.unget()
-                break
-
-        return lhs
-
-def parse_decl(tokens):
-    """Parse a variable declaration.
-
-        >>> from pprint import pprint
-        >>> test = lambda text: pprint(parse_decl(tokenize(text)))
-
-        >>> test(')')
-        None
-
-        >>> test('int x')
-        ('x', ('basic', 'int'))
-
-        >>> test('int *x')
-        ('x', ('ptr', ('basic', 'int')))
-
-        >>> test('int **x')
-        ('x', ('ptr', ('ptr', ('basic', 'int'))))
-
-        >>> test('int *x[3]')
-        ('x', ('array', 3, ('ptr', ('basic', 'int'))))
-
-        >>> test('struct point *p')
-        ('p', ('ptr', ('struct', 'point')))
-
-    """
-    def expect(expected):
-        toktype, token = tokens.get_next()
-        if token != expected:
-            raise Exception(f"Expected {expected!r}")
-    if not isinstance(tokens, TokenIterator):
-        tokens = TokenIterator(tokens)
-    with tokens:
-        toktype, token = tokens.get_next()
-        if toktype == 'type':
-            decl_type = ('basic', token)
-        elif token in ('struct', 'union'):
-            prev_token = token
-            toktype, token = tokens.get_next()
-            if toktype != 'name':
-                raise Exception("Expected a name")
-            decl_type = (prev_token, token)
-        else:
-            tokens.unget()
-            return None
-
-        ptr_depth = 0
-        while True:
-            toktype, token = tokens.get_next()
-            if token == '*':
-                ptr_depth += 1
-            else:
-                tokens.unget()
-                break
-
-        toktype, token = tokens.get_next()
-        if toktype != 'name':
-            raise Exception("Expected a name")
-        name = token
-
-        for i in range(ptr_depth):
-            decl_type = ('ptr', decl_type)
-
-        toktype, token = tokens.get_next()
-        if token == '[':
-            toktype, token = tokens.get_next()
-            if toktype != 'num':
-                raise Exception("Expected a number")
-            index = int(token)
-            expect(']')
-            decl_type = ('array', index, decl_type)
-        else:
-            tokens.unget()
-
-        return (name, decl_type)
-
-def parse_statement(tokens):
-    """Parse a statement.
-
-        >>> from pprint import pprint
-        >>> test = lambda text: pprint(parse_statement(tokenize(text)))
-
-        >>> test(')')
-        None
-
-        >>> test('1 + 2')
-        Traceback (most recent call last):
-         ...
-        tinc.ParseError: In file <NO FILE>, row 1, col 6 (''): Expected ';'
-
-        >>> test('1 + 2;')
-        ('expr', ('binop', 'add', ('atom', 'num', '1'), ('atom', 'num', '2')))
-
-        >>> test('int x;')
-        ('decl', 'x', ('basic', 'int'), None)
-
-        >>> test('int x = 3;')
-        ('decl', 'x', ('basic', 'int'), ('atom', 'num', '3'))
-
-        >>> test('{ int x = 3; f(&x); }')
-        ('block',
-         [('decl', 'x', ('basic', 'int'), ('atom', 'num', '3')),
-          ('expr',
-           ('call', ('atom', 'name', 'f'), [('unop', 'addr', ('atom', 'name', 'x'))]))])
-
-        >>> test('if (x == 3) { break; }')
-        ('if',
-         ('binop', 'eq', ('atom', 'name', 'x'), ('atom', 'num', '3')),
-         ('block', [('break',)]),
-         None)
-
-        >>> test('if (true) 1; else 2;')
-        ('if',
-         ('atom', 'name', 'true'),
-         ('expr', ('atom', 'num', '1')),
-         ('expr', ('atom', 'num', '2')))
-
-        >>> test('while (true) ;')
-        ('while', ('atom', 'name', 'true'), ('noop',))
-
-    """
-    def expect(expected):
-        toktype, token = tokens.get_next()
-        if token != expected:
-            raise Exception(f"Expected {expected!r}")
-    if not isinstance(tokens, TokenIterator):
-        tokens = TokenIterator(tokens)
-    with tokens:
-        toktype, token = tokens.get_next()
-        if token == '{':
-            statements = []
-            while True:
-                child = parse_statement(tokens)
-                if child is None:
-                    break
-                statements.append(child)
-            expect('}')
-            return ('block', statements)
-        elif token == 'if':
-            expect('(')
-            cond = parse_expr(tokens)
-            if cond is None:
-                raise Exception("Expected an expression")
-            expect(')')
-            if_branch = parse_statement(tokens)
-            if if_branch is None:
-                raise Exception("Expected a statement")
-            toktype, token = tokens.get_next()
-            if token == 'else':
-                else_branch = parse_statement(tokens)
-                if else_branch is None:
-                    raise Exception("Expected a statement")
-            else:
-                else_branch = None
-                tokens.unget()
-            return ('if', cond, if_branch, else_branch)
-        elif token == 'while':
-            expect('(')
-            cond = parse_expr(tokens)
-            if cond is None:
-                raise Exception("Expected an expression")
-            expect(')')
-            child = parse_statement(tokens)
-            if child is None:
-                raise Exception("Expected a statement")
-            return ('while', cond, child)
-        elif toktype == 'type' or token in ('struct', 'union'):
-            tokens.unget()
-            name, child = parse_decl(tokens)
-            toktype, token = tokens.get_next()
-            if token == '=':
-                default = parse_expr(tokens)
-                if default is None:
-                    raise Exception("Expected an expression")
-            else:
-                default = None
-                tokens.unget()
-            expect(';')
-            return ('decl', name, child, default)
-        elif token == ';':
-            return ('noop',)
-        elif token in ('break', 'continue'):
-            expect(';')
-            return (token,)
-        else:
-            tokens.unget()
-            expr = parse_expr(tokens)
-            if expr is not None:
-                expect(';')
-                return ('expr', expr)
-            else:
-                return None
-
-
-class TinyCompiler:
+class TincParser:
     """The TINC language (think "Tiny C") compiles to the assembly language
     used by the TinyProcessor."""
 
-    def __init__(self):
-        pass
+    def __init__(self, tokens):
+        if not isinstance(tokens, TokenIterator):
+            tokens = TokenIterator(tokens)
+        self.tokens = tokens
+        self.typedefs = {}
+
+        self.get_next = tokens.get_next
+        self.unget = tokens.unget
+
+    def expect(self, expected):
+        toktype, token = self.get_next()
+        if token != expected:
+            raise Exception(f"Expected {expected!r}")
+
+    def is_type(self, toktype: str, token: str) -> bool:
+        return (
+            toktype == 'type'
+            or token in ('struct', 'union', 'enum')
+            or token in self.typedefs)
+
+    def parse_expr(self, prev_prec: int = None, decl: bool = False):
+        """Parse an expression.
+
+            >>> from pprint import pprint
+            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_expr())
+
+            >>> test(')')
+            None
+
+            >>> test('1 + (2 + #define)')
+            Traceback (most recent call last):
+             ...
+            tinc.ParseError: In file <NO FILE>, row 1, col 10 ('#define'): Expected an expression
+
+            >>> test('1 + 2 + 3')
+            ('binop',
+             'add',
+             ('binop', 'add', ('atom', 'num', '1'), ('atom', 'num', '2')),
+             ('atom', 'num', '3'))
+
+            >>> test('1 * 2 + 3')
+            ('binop',
+             'add',
+             ('binop', 'mul', ('atom', 'num', '1'), ('atom', 'num', '2')),
+             ('atom', 'num', '3'))
+
+            >>> test('1 + 2 * 3')
+            ('binop',
+             'add',
+             ('atom', 'num', '1'),
+             ('binop', 'mul', ('atom', 'num', '2'), ('atom', 'num', '3')))
+
+            >>> test('(1 * - 2) + f(3, 4)[5]')
+            ('binop',
+             'add',
+             ('binop', 'mul', ('atom', 'num', '1'), ('unop', 'neg', ('atom', 'num', '2'))),
+             ('index',
+              ('call', ('atom', 'name', 'f'), [('atom', 'num', '3'), ('atom', 'num', '4')]),
+              ('atom', 'num', '5')))
+
+            >>> test('{10, 20, 30}[i]')
+            ('index',
+             ('array',
+              [('atom', 'num', '10'), ('atom', 'num', '20'), ('atom', 'num', '30')]),
+             ('atom', 'name', 'i'))
+
+        """
+        with self.tokens:
+            toktype, token = self.get_next()
+            if toktype == 'op':
+                op = UNOPS_BY_TOKEN.get(token)
+                if op is None:
+                    raise Exception(f"Not a unary operator: {token!r}")
+                child = self.parse_expr(op.prec)
+                if child is None:
+                    raise Exception("Expected an expression")
+                lhs = ('unop', op.name, child)
+            elif token == '(':
+                child = self.parse_expr()
+                if child is None:
+                    raise Exception("Expected an expression")
+                self.expect(')')
+                lhs = child
+            elif token == '{':
+                children = []
+                while True:
+                    child = self.parse_expr()
+                    if child is None:
+                        break
+                    children.append(child)
+                    toktype, token = self.get_next()
+                    if token != ',':
+                        self.unget()
+                        break
+                self.expect('}')
+                lhs = ('array', children)
+            elif toktype in ('name', 'num', 'hex', 'ptr', 'str'):
+                lhs = ('atom', toktype, token)
+            else:
+                self.unget()
+                return None
+
+            while True:
+                toktype, token = self.get_next()
+                if toktype == 'op':
+                    op = BINOPS_BY_TOKEN.get(token)
+                    if op is None:
+                        raise Exception(f"Not a binary operator: {token!r}")
+                    if prev_prec is not None and op.prec >= prev_prec:
+                        self.unget()
+                        break
+                    rhs = self.parse_expr(op.prec)
+                    if rhs is None:
+                        raise Exception("Expected an expression")
+                    lhs = ('binop', op.name, lhs, rhs)
+                elif token == '(':
+                    args = []
+                    while True:
+                        arg = self.parse_expr()
+                        if arg is None:
+                            break
+                        args.append(arg)
+                        toktype, token = self.get_next()
+                        if token != ',':
+                            self.unget()
+                            break
+                    self.expect(')')
+                    lhs = ('call', lhs, args)
+                elif token == '[':
+                    rhs = self.parse_expr()
+                    if rhs is None:
+                        raise Exception("Expected an expression")
+                    self.expect(']')
+                    lhs = ('index', lhs, rhs)
+                else:
+                    self.unget()
+                    break
+
+            return lhs
+
+    def parse_decl(self):
+        """Parse a variable declaration.
+
+            >>> from pprint import pprint
+            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_decl())
+
+            >>> test(')')
+            (None, None)
+
+            >>> test('int')
+            (None, ('basic', 'int'))
+
+            >>> test('int *')
+            (None, ('ptr', ('basic', 'int')))
+
+            >>> test('int x')
+            ('x', ('basic', 'int'))
+
+            >>> test('int *x')
+            ('x', ('ptr', ('basic', 'int')))
+
+            >>> test('int **x')
+            ('x', ('ptr', ('ptr', ('basic', 'int'))))
+
+            >>> test('int *x[3]')
+            ('x', ('array', 3, ('ptr', ('basic', 'int'))))
+
+            >>> test('struct point *p')
+            ('p', ('ptr', ('struct', 'point', None)))
+
+            >>> test('struct point { int x; int y; } *p')
+            ('p',
+             ('ptr',
+              ('struct', 'point', [('x', ('basic', 'int')), ('y', ('basic', 'int'))])))
+
+            >>> test('struct { int x; int y; } *p')
+            ('p',
+             ('ptr', ('struct', None, [('x', ('basic', 'int')), ('y', ('basic', 'int'))])))
+
+            >>> test('enum E {x, y = 1, z}')
+            (None, ('enum', 'E', [('x', None), ('y', ('atom', 'num', '1')), ('z', None)]))
+
+        """
+        with self.tokens:
+            toktype, token = self.get_next()
+            if toktype == 'type':
+                decl_type = ('basic', token)
+            elif token in ('struct', 'union', 'enum'):
+                tag = token
+                name = None
+                children = None
+                toktype, token = self.get_next()
+                if toktype == 'name':
+                    name = token
+                    toktype, token = self.get_next()
+                if token == '{':
+                    children = []
+                    if tag == 'enum':
+                        while True:
+                            toktype, token = self.get_next()
+                            if toktype != 'name':
+                                self.unget()
+                                break
+                            child_name = token
+                            default = None
+                            toktype, token = self.get_next()
+                            if token == '=':
+                                default = self.parse_expr()
+                                if default is None:
+                                    raise Exception("Expected an expression")
+                            else:
+                                self.unget()
+                            children.append((child_name, default))
+                            toktype, token = self.get_next()
+                            if token != ',':
+                                self.unget()
+                                break
+                    else:
+                        while True:
+                            child_name, child = self.parse_decl()
+                            if child is None:
+                                break
+                            self.expect(';')
+                            children.append((child_name, child))
+                    self.expect('}')
+                else:
+                    self.unget()
+                if name is None and children is None:
+                    raise Exception("Expected a name or '{'")
+                decl_type = (tag, name, children)
+            elif token in self.typedefs:
+                decl_type = self.typedefs[token]
+            else:
+                self.unget()
+                return None, None
+
+            ptr_depth = 0
+            while True:
+                toktype, token = self.get_next()
+                if token == '*':
+                    ptr_depth += 1
+                else:
+                    self.unget()
+                    break
+            for i in range(ptr_depth):
+                decl_type = ('ptr', decl_type)
+
+            name = None
+            toktype, token = self.get_next()
+            if toktype == 'name':
+                name = token
+            else:
+                self.unget()
+
+            toktype, token = self.get_next()
+            if token == '[':
+                toktype, token = self.get_next()
+                if toktype != 'num':
+                    raise Exception("Expected a number")
+                index = int(token)
+                self.expect(']')
+                decl_type = ('array', index, decl_type)
+            else:
+                self.unget()
+
+            return (name, decl_type)
+
+    def parse_statement(self):
+        """Parse a statement.
+
+            >>> from pprint import pprint
+            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_statement())
+
+            >>> test(')')
+            None
+
+            >>> test('1 + 2')
+            Traceback (most recent call last):
+             ...
+            tinc.ParseError: In file <NO FILE>, row 1, col 6 (''): Expected ';'
+
+            >>> test('1 + 2;')
+            ('expr', ('binop', 'add', ('atom', 'num', '1'), ('atom', 'num', '2')))
+
+            >>> test('int x;')
+            ('decl', 'x', ('basic', 'int'), None)
+
+            >>> test('int x = 3;')
+            ('decl', 'x', ('basic', 'int'), ('atom', 'num', '3'))
+
+            >>> test('{ int x = 3; f(&x); }')
+            ('block',
+             [('decl', 'x', ('basic', 'int'), ('atom', 'num', '3')),
+              ('expr',
+               ('call', ('atom', 'name', 'f'), [('unop', 'addr', ('atom', 'name', 'x'))]))])
+
+            >>> test('if (x == 3) { break; }')
+            ('if',
+             ('binop', 'eq', ('atom', 'name', 'x'), ('atom', 'num', '3')),
+             ('block', [('break',)]),
+             None)
+
+            >>> test('if (true) 1; else 2;')
+            ('if',
+             ('atom', 'name', 'true'),
+             ('expr', ('atom', 'num', '1')),
+             ('expr', ('atom', 'num', '2')))
+
+            >>> test('while (true) ;')
+            ('while', ('atom', 'name', 'true'), ('noop',))
+
+        """
+        with self.tokens:
+            toktype, token = self.get_next()
+            if token == '{':
+                statements = []
+                while True:
+                    child = self.parse_statement()
+                    if child is None:
+                        break
+                    statements.append(child)
+                self.expect('}')
+                return ('block', statements)
+            elif token == 'if':
+                self.expect('(')
+                cond = self.parse_expr()
+                if cond is None:
+                    raise Exception("Expected an expression")
+                self.expect(')')
+                if_branch = self.parse_statement()
+                if if_branch is None:
+                    raise Exception("Expected a statement")
+                toktype, token = self.get_next()
+                if token == 'else':
+                    else_branch = self.parse_statement()
+                    if else_branch is None:
+                        raise Exception("Expected a statement")
+                else:
+                    else_branch = None
+                    self.unget()
+                return ('if', cond, if_branch, else_branch)
+            elif token == 'while':
+                self.expect('(')
+                cond = self.parse_expr()
+                if cond is None:
+                    raise Exception("Expected an expression")
+                self.expect(')')
+                child = self.parse_statement()
+                if child is None:
+                    raise Exception("Expected a statement")
+                return ('while', cond, child)
+            elif self.is_type(toktype, token):
+                self.unget()
+                name, child = self.parse_decl()
+                toktype, token = self.get_next()
+                if token == '=':
+                    default = self.parse_expr()
+                    if default is None:
+                        raise Exception("Expected an expression")
+                else:
+                    default = None
+                    self.unget()
+                self.expect(';')
+                return ('decl', name, child, default)
+            elif token == ';':
+                return ('noop',)
+            elif token in ('break', 'continue'):
+                self.expect(';')
+                return (token,)
+            else:
+                self.unget()
+                expr = self.parse_expr()
+                if expr is not None:
+                    self.expect(';')
+                    return ('expr', expr)
+                else:
+                    return None
+
+    def parse_toplevel(self):
+        """Parse a top-level statement.
+
+            >>> from pprint import pprint
+            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_toplevel())
+
+            >>> test('+')
+            None
+
+            >>> test('typedef int *i;')
+            ('typedef', 'i', ('ptr', ('basic', 'int')))
+
+        """
+        with self.tokens:
+            toktype, token = self.get_next()
+            if self.is_type(toktype, token):
+                self.unget()
+                name, child = self.parse_decl()
+                toktype, token = self.get_next()
+                if token == '=':
+                    default = self.parse_expr()
+                    if default is None:
+                        raise Exception("Expected an expression")
+                else:
+                    default = None
+                    self.unget()
+                self.expect(';')
+                return ('decl', name, child, default)
+            elif token == 'typedef':
+                name, child = self.parse_decl()
+                if child is None:
+                    raise Exception("Expected a declaration")
+                if name is None:
+                    raise Exception("typedefs require a name")
+                return ('typedef', name, child)
+            elif token == ';':
+                return ('noop',)
+            else:
+                return None
+
+    def parse(self):
+        toplevels = []
+        with self.tokens:
+            while True:
+                toplevel = self.parse_toplevel()
+                if toplevel is None:
+                    break
+                toplevels.append(toplevel)
+                tag = toplevel[0]
+                if tag == 'typedef':
+                    name = toplevel[1]
+                    if name in self.typedefs:
+                        raise Exception(f"Redefinition of typedef {name!r}")
+                    self.typedefs[name] = toplevel[2]
+            toktype, token = self.get_next()
+            if toktype != 'eof':
+                raise Exception("Expected end of file!")
+        return toplevels
