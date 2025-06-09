@@ -1,8 +1,10 @@
 import re
 import sys
 from argparse import ArgumentParser
+from pprint import pformat
 from typing import List, Tuple, Dict, NamedTuple, Optional, Any
 from collections import deque
+from contextlib import contextmanager
 
 from tinycomp import *
 
@@ -130,22 +132,21 @@ KEYWORDS = (
 )
 
 TOKEN_PATTERNS = {
-    'comment': r'//.*',
-    'num': r'-?[0-9]+',
+    'comment': r'//.*|/\*.*?\*/',
     'hex': r'0x[0-9a-fA-F]+',
-    'ptr': r'&0x[0-9a-fA-F]+',
-    'str': r'"(?:[^"]|\\")*"',
+    'num': r'-?[0-9]+',
+    'chr': r"'(?:[^'\\]|\\.)'",
+    'str': r'"(?:[^"\\]|\\.)*"',
     'directive': r'#[_a-zA-Z]+',
     'keyword': '|'.join(KEYWORDS),
     'type': '|'.join(BASIC_TYPES),
     'name': r'[_a-zA-Z][_a-zA-Z0-9]*',
     'op': '|'.join(re.escape(op.token) for op in OPS if op.token),
     'special': r'[()\[\]{},;]',
+    'err': r'[\S]+',
 }
 TOKEN_REGEX = re.compile('|'.join(
     f'(?P<{name}>{pat})' for name, pat in TOKEN_PATTERNS.items()))
-
-ATOM_TOKENS = ('name', 'num', 'hex', 'ptr', 'str')
 
 
 class ParseError(Exception):
@@ -162,7 +163,7 @@ def tokenize(text: str, filename: str = '<NO FILE>') -> List[Token]:
     """
 
         >>> text = '''#include "some file" // a comment!
-        ... if (x == 3) {
+        ... if (x == 3 /* another comment! */) {
         ...     break
         ... }'''
         >>> for token in tokenize(text, 'test.c'): print(token)
@@ -174,8 +175,9 @@ def tokenize(text: str, filename: str = '<NO FILE>') -> List[Token]:
         Token(toktype='name', token='x', filename='test.c', row=2, col=5)
         Token(toktype='op', token='==', filename='test.c', row=2, col=7)
         Token(toktype='num', token='3', filename='test.c', row=2, col=10)
-        Token(toktype='special', token=')', filename='test.c', row=2, col=11)
-        Token(toktype='special', token='{', filename='test.c', row=2, col=13)
+        Token(toktype='comment', token='/* another comment! */', filename='test.c', row=2, col=12)
+        Token(toktype='special', token=')', filename='test.c', row=2, col=34)
+        Token(toktype='special', token='{', filename='test.c', row=2, col=36)
         Token(toktype='keyword', token='break', filename='test.c', row=3, col=5)
         Token(toktype='special', token='}', filename='test.c', row=4, col=1)
         Token(toktype='eof', token='', filename='test.c', row=4, col=2)
@@ -278,7 +280,9 @@ class TincParser:
     used by the TinyProcessor."""
 
     def __init__(self, tokens):
-        if not isinstance(tokens, TokenIterator):
+        if isinstance(tokens, str):
+            tokens = TokenIterator(tokenize(tokens))
+        elif not isinstance(tokens, TokenIterator):
             tokens = TokenIterator(tokens)
         self.tokens = tokens
         self.typedefs = {}
@@ -287,6 +291,7 @@ class TincParser:
             'union': {},
             'enum': {},
         }
+        self.strings = set()
 
         self.get_next = tokens.get_next
         self.unget = tokens.unget
@@ -303,13 +308,46 @@ class TincParser:
             or token in self.typedefs)
 
     def parse_expr(self, prev_op: Operator = None):
-        """Parse an expression.
+        r"""Parse an expression.
 
             >>> from pprint import pprint
-            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_expr())
+            >>> test = lambda text: pprint(TincParser(text).parse_expr())
 
             >>> test(')')
             None
+
+            >>> test('1')
+            ('num', 1)
+
+            >>> test('-1')
+            ('num', -1)
+
+            >>> test('0xff')
+            ('hex', 255)
+
+            >>> test("'x")
+            None
+
+            >>> test("'0'")
+            ('chr', '0')
+
+            >>> test("'\\0'")
+            ('chr', '\x00')
+
+            >>> test("'\\\\'")
+            ('chr', '\\')
+
+            >>> test('"hello')
+            None
+
+            >>> test('"hello\\nworld"')
+            ('str', 'hello\nworld')
+
+            >>> test('"hello\\0world"')
+            ('str', 'hello\x00world')
+
+            >>> test('"\\"hello world\\""')
+            ('str', '"hello world"')
 
             >>> test('1 + (2 + #define)')
             Traceback (most recent call last):
@@ -317,55 +355,42 @@ class TincParser:
             tinc.ParseError: In file <NO FILE>, row 1, col 10 ('#define'): Expected an expression
 
             >>> test('1 + 2 + 3')
-            ('add',
-             ('add', ('atom', 'num', '1'), ('atom', 'num', '2')),
-             ('atom', 'num', '3'))
+            ('add', ('add', ('num', 1), ('num', 2)), ('num', 3))
 
             >>> test('x = y = z')
-            ('assign',
-             ('atom', 'name', 'x'),
-             ('assign', ('atom', 'name', 'y'), ('atom', 'name', 'z')))
+            ('assign', ('name', 'x'), ('assign', ('name', 'y'), ('name', 'z')))
 
             >>> test('1 * 2 + 3')
-            ('add',
-             ('mul', ('atom', 'num', '1'), ('atom', 'num', '2')),
-             ('atom', 'num', '3'))
+            ('add', ('mul', ('num', 1), ('num', 2)), ('num', 3))
 
             >>> test('1 + 2 * 3')
-            ('add',
-             ('atom', 'num', '1'),
-             ('mul', ('atom', 'num', '2'), ('atom', 'num', '3')))
+            ('add', ('num', 1), ('mul', ('num', 2), ('num', 3)))
 
             >>> test('(1 * - 2) + f(3, 4)[5]')
             ('add',
-             ('mul', ('atom', 'num', '1'), ('neg', ('atom', 'num', '2'))),
-             ('index',
-              ('call', ('atom', 'name', 'f'), [('atom', 'num', '3'), ('atom', 'num', '4')]),
-              ('atom', 'num', '5')))
+             ('mul', ('num', 1), ('neg', ('num', 2))),
+             ('index', ('call', ('name', 'f'), [('num', 3), ('num', 4)]), ('num', 5)))
 
             >>> test('{10, 20, 30}[i]')
-            ('index',
-             ('array',
-              [('atom', 'num', '10'), ('atom', 'num', '20'), ('atom', 'num', '30')]),
-             ('atom', 'name', 'i'))
+            ('index', ('array', [('num', 10), ('num', 20), ('num', 30)]), ('name', 'i'))
 
             >>> test('*x[3]')
-            ('deref', ('index', ('atom', 'name', 'x'), ('atom', 'num', '3')))
+            ('deref', ('index', ('name', 'x'), ('num', 3)))
 
             >>> test('(*x)[3])')
-            ('index', ('deref', ('atom', 'name', 'x')), ('atom', 'num', '3'))
+            ('index', ('deref', ('name', 'x')), ('num', 3))
 
             >>> test('f()')
-            ('call', ('atom', 'name', 'f'), [])
+            ('call', ('name', 'f'), [])
 
             >>> test('f(1, 2)')
-            ('call', ('atom', 'name', 'f'), [('atom', 'num', '1'), ('atom', 'num', '2')])
+            ('call', ('name', 'f'), [('num', 1), ('num', 2)])
 
             >>> test('*f()')
-            ('deref', ('call', ('atom', 'name', 'f'), []))
+            ('deref', ('call', ('name', 'f'), []))
 
             >>> test('(*f)()')
-            ('call', ('deref', ('atom', 'name', 'f')), [])
+            ('call', ('deref', ('name', 'f')), [])
 
         """
         with self.tokens:
@@ -397,8 +422,29 @@ class TincParser:
                         break
                 self.expect('}')
                 lhs = ('array', children)
-            elif toktype in ('name', 'num', 'hex', 'ptr', 'str'):
-                lhs = ('atom', toktype, token)
+            elif toktype == 'name':
+                lhs = ('name', token)
+            elif toktype == 'num':
+                lhs = ('num', int(token))
+            elif toktype == 'hex':
+                lhs = ('hex', int(token[2:], 16))
+            elif toktype == 'chr':
+                token = token[1:-1] # strip '...'
+                if token[0] == '\\':
+                    c = token[1]
+                    if c == 'n':
+                        c = '\n'
+                    elif c == '0':
+                        c = '\0'
+                else:
+                    c = token
+                lhs = ('chr', c)
+            elif toktype == 'str':
+                token = token[1:-1] # strip "..."
+                token = token.replace('\\n', '\n').replace('\\0', '\0')
+                token = re.sub(r'\\(.)', '\\1', token)
+                self.strings.add(token)
+                lhs = ('str', token)
             else:
                 self.unget()
                 return None
@@ -457,7 +503,7 @@ class TincParser:
         built on top of it.
 
             >>> from pprint import pprint
-            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_type_expr())
+            >>> test = lambda text: pprint(TincParser(text).parse_type_expr())
 
             >>> test('')
             (None, 'base')
@@ -583,7 +629,7 @@ class TincParser:
         The name may be None.
 
             >>> from pprint import pprint
-            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_decl())
+            >>> test = lambda text: pprint(TincParser(text).parse_decl())
 
             >>> test(')')
             None
@@ -692,7 +738,7 @@ class TincParser:
         """Parse a statement.
 
             >>> from pprint import pprint
-            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_statement())
+            >>> test = lambda text: pprint(TincParser(text).parse_statement())
 
             >>> test(')')
             None
@@ -703,33 +749,27 @@ class TincParser:
             tinc.ParseError: In file <NO FILE>, row 1, col 6 (''): Expected ';'
 
             >>> test('1 + 2;')
-            ('expr', ('add', ('atom', 'num', '1'), ('atom', 'num', '2')))
+            ('expr', ('add', ('num', 1), ('num', 2)))
 
             >>> test('int x;')
             ('decl', 'x', ('basic', 'int'), None)
 
             >>> test('int x = 3;')
-            ('decl', 'x', ('basic', 'int'), ('atom', 'num', '3'))
+            ('decl', 'x', ('basic', 'int'), ('num', 3))
 
             >>> test('{ int x = 3; f(&x); }')
             ('block',
-             [('decl', 'x', ('basic', 'int'), ('atom', 'num', '3')),
-              ('expr', ('call', ('atom', 'name', 'f'), [('addr', ('atom', 'name', 'x'))]))])
+             [('decl', 'x', ('basic', 'int'), ('num', 3)),
+              ('expr', ('call', ('name', 'f'), [('addr', ('name', 'x'))]))])
 
             >>> test('if (x == 3) { break; }')
-            ('if',
-             ('eq', ('atom', 'name', 'x'), ('atom', 'num', '3')),
-             ('block', [('break',)]),
-             None)
+            ('if', ('eq', ('name', 'x'), ('num', 3)), ('block', [('break',)]), None)
 
             >>> test('if (true) 1; else 2;')
-            ('if',
-             ('atom', 'name', 'true'),
-             ('expr', ('atom', 'num', '1')),
-             ('expr', ('atom', 'num', '2')))
+            ('if', ('name', 'true'), ('expr', ('num', 1)), ('expr', ('num', 2)))
 
             >>> test('while (true) ;')
-            ('while', ('atom', 'name', 'true'), ('noop',))
+            ('while', ('name', 'true'), ('noop',))
 
         """
         with self.tokens:
@@ -808,7 +848,7 @@ class TincParser:
         """Parse a top-level statement.
 
             >>> from pprint import pprint
-            >>> test = lambda text: pprint(TincParser(tokenize(text)).parse_toplevel())
+            >>> test = lambda text: pprint(TincParser(text).parse_toplevel())
 
             >>> test('+')
             None
@@ -822,12 +862,15 @@ class TincParser:
             >>> test('typedef int adder(int);')
             ('typedef', 'adder', ('func', ('basic', 'int'), [(None, ('basic', 'int'))]))
 
+            >>> test('int adder(int x) ;')
+            ('def', 'adder', ('basic', 'int'), {'x': ('basic', 'int')}, ('noop',))
+
             >>> test('int adder(int x) return i + 1;')
             ('def',
              'adder',
              ('basic', 'int'),
              {'x': ('basic', 'int')},
-             ('return', ('add', ('atom', 'name', 'i'), ('atom', 'num', '1'))))
+             ('return', ('add', ('name', 'i'), ('num', 1))))
 
             >>> test('int adder return i + 1;')
             Traceback (most recent call last):
@@ -854,9 +897,11 @@ class TincParser:
                     default = None
                     self.unget()
                 toktype, token = self.get_next()
-                if token == ';':
+                if token == ';' and type_expr[0] != 'func':
                     return ('decl', name, type_expr, default)
                 elif default is not None:
+                    if type_expr[0] == 'func':
+                        raise Exception("Cannot assign to functions")
                     raise Exception("Expected ';'")
                 elif type_expr[0] != 'func':
                     raise Exception("Expected '=' or ';'")
@@ -904,9 +949,234 @@ class TincParser:
         return toplevels
 
 
+class TincAssembler:
+
+    def __init__(self, parser: TincParser, *,
+            main_label='main',
+            sp='D',
+            stack_size=16 * 8,
+            ):
+        self.parser = parser
+        self.main_label = main_label
+        self.sp = sp # "stack pointer" register!
+        self.stack_size = stack_size
+
+        self.labels = {}
+        self.varstack = []
+        self.sizestack = []
+        self.loopstack = []
+        self.lines = []
+
+    def resolve_type_expr(self, type_expr):
+        while type_expr[0] == 'typedef':
+            type_expr = self.typedefs[type_expr[1]]
+        return type_expr
+
+    def get_size(self, type_expr) -> int:
+        type_expr = self.resolve_type_expr(type_expr)
+        tag = type_expr[0]
+        if tag == 'ptr':
+            return 2
+        elif tag == 'array':
+            return 2
+        elif tag == 'func':
+            return 2
+        elif tag == 'basic':
+            typename = type_expr[1]
+            vtype = BASIC_TYPES[typename]
+            return VT_SIZE[vtype]
+        else:
+            raise Exception(f"Unknown type expression tag: {tag!r}")
+
+    def get_value_str(self, type_expr, value=None) -> str:
+        if value is None:
+            value = 0
+        type_expr = self.resolve_type_expr(type_expr)
+        tag = type_expr[0]
+        if tag in ('ptr', 'array'):
+            return f'&{hex(value)}'
+        elif tag == 'func':
+            raise Exception("Function values can't be referred to directly")
+        elif tag == 'basic':
+            typename = type_expr[1]
+            if typename == 'int':
+                return str(value)
+            elif typename == 'char':
+                if value == '\0':
+                    return '"\\0"'
+                elif value == '\n':
+                    return '"\\n"'
+                else:
+                    return '"{chr(value)}"'
+            elif typename == 'byte':
+                return hex(value)
+            elif typename == 'inst':
+                return inst_repr(value)
+            elif typename == 'void':
+                raise Exception("Void type isn't real, you know.")
+            else:
+                raise Exception(f"Unknown basic type: {typename!r}")
+        else:
+            raise Exception(f"Unknown type expression tag: {tag!r}")
+
+    @contextmanager
+    def push_block(self, vars=None):
+        vars = {} if vars is None else vars.copy()
+        self.varstack.append(vars)
+        self.sizestack.append(0)
+        yield
+        size = self.sizestack.pop()
+        if size:
+            self.lines.append(f'{self.sp}- {size}')
+        assert self.varstack.pop() is vars
+
+    def push_var(self, name, type_expr, default=None):
+        vars = self.varstack[-1]
+        if name in vars:
+            raise Exception(f"Redefinition of variable {name!r}")
+        vars[name] = type_expr
+        size = self.get_size(type_expr)
+        if size == 1:
+            instr = f'.{self.sp}='
+        elif size == 2:
+            instr = f':{self.sp}='
+        else:
+            raise Exception(f"Can't handle values of size: {size}")
+        default_str = self.get_value_str(type_expr, default)
+        self.lines.append(f'{instr} {default_str}')
+        self.lines.append(f'{self.sp}+ {size}')
+        self.sizestack[-1] += size
+
+    def assemble_expr(self, expr):
+        tag = expr[0]
+        if tag == 'name':
+            name = expr[1]
+            vars = self.varstack[-1]
+            if name in vars:
+                raise Exception("TODO")
+            elif name in labels:
+                raise Exception("TODO")
+            else:
+                raise Exception("Unknown name {name!r}")
+        elif tag == 'call':
+            raise Exception("TODO")
+        elif tag == 'index':
+            raise Exception("TODO")
+        elif tag in OPS_BY_NAME:
+            op = OPS_BY_NAME[tag]
+            if op.arity == UNARY_OP:
+                self.assemble_expr(expr[1])
+                raise Exception("TODO")
+            elif op.arity == BINARY_OP:
+                self.assemble_expr(expr[1])
+                self.assemble_expr(expr[2])
+                raise Exception("TODO")
+            else:
+                raise Exception(f"Unknown arity: {op.arity!r}")
+        else:
+            raise Exception(f"Unknown expression type: {tag!r}")
+
+    def assemble_statement(self, statement):
+        tag = statement[0]
+        if tag == 'noop':
+            self.lines.append('NOOP')
+        elif tag == 'block':
+            with self.push_block():
+                for child in statement[1]:
+                    self.assemble_statement(child)
+        elif tag == 'decl':
+            tag, name, expr, default = statement
+            if name is None:
+                raise Exception(f"Name required for variable declaration")
+            self.push_var(name, expr, default)
+        elif tag == 'expr':
+            self.assemble_expr(statement[1])
+        elif tag in ('continue', 'break'):
+            if not self.loopstack:
+                raise Exception("Not allowed outside of a loop")
+            loop_i = len(self.loopstack)
+            self.lines.append(f'JMP __loop_{loop_i}_{"start" if tag == "continue" else "end"}')
+        else:
+            raise Exception(f"Unknown statement type: {tag!r}")
+
+    def assemble(self, toplevels=None):
+        """
+
+            >>> def test(text):
+            ...     asm = TincAssembler(TincParser(text))
+            ...     for line in asm.assemble(): print(line)
+
+            >>> test('void main() ;')
+            JMP main
+            tinc_stack: %zeros 128
+            main:
+            NOOP
+
+            >>> test('void main() {}')
+            JMP main
+            tinc_stack: %zeros 128
+            main:
+
+            >>> test('void main() { int x; }')
+            JMP main
+            tinc_stack: %zeros 128
+            main:
+            :D= 0
+            D+ 2
+            D- 2
+
+            >>> test('void main() { int x = 3; x + 2; }')
+            JMP main
+            tinc_stack: %zeros 128
+            main:
+            :D= 3
+            D+ 2
+            D- 2
+
+        """
+        if toplevels is None:
+            toplevels = self.parser.parse()
+        self.lines.append(f'JMP {self.main_label}')
+        self.lines.append(f'tinc_stack: %zeros {self.stack_size}')
+        for i, toplevel in enumerate(toplevels, 1):
+            try:
+                tag = toplevel[0]
+                if tag in ('noop', 'typedef'):
+                    pass
+                elif tag == 'decl':
+                    tag, name, expr, default = toplevel
+                    if name is not None:
+                        if name in self.labels:
+                            raise Exception(f"Redefinition of {name!r}")
+                        self.labels[name] = i
+                        default_str = self.get_value_str(expr, default)
+                        self.lines.append(f"{name}: {default_str}")
+                elif tag == 'def':
+                    tag, name, ret_expr, args, statement = toplevel
+                    if name in self.labels:
+                        raise Exception(f"Redefinition of {name!r}")
+                    self.labels[name] = i
+                    try:
+                        with self.push_block(args):
+                            self.lines.append(f"{name}:")
+                            self.assemble_statement(statement)
+                    except Exception as ex:
+                        raise ParseError(f"In definition of {name!r}: {ex}")
+                else:
+                    raise Exception(f"Unknown top-level statement type: {tag!r}")
+            except Exception as ex:
+                print(
+                    f"Error assembling top-level statement {i}:\n  {pformat(toplevel)}",
+                    file=sys.stderr)
+                raise ParseError(f"Error assembling top-level statement {i}: {ex}")
+
+        return self.lines
+
+
 def parse_cli_args():
     parser = ArgumentParser()
     parser.add_argument('--file', '-f', required=True)
+    parser.add_argument('--parse-tree', '-p', default=False, action='store_true')
     return parser.parse_args()
 
 
@@ -922,9 +1192,13 @@ def main(args=None):
     text = file.read()
     file.close()
     parser = TincParser(tokenize(text, filename))
-    toplevels = parser.parse()
-    for toplevel in toplevels:
-        print(toplevel)
+    if args.parse_tree:
+        for i, toplevel in enumerate(parser.parse(), 1):
+            print(f"{i}: {toplevel}")
+    else:
+        asm = TincAssembler(parser)
+        for line in asm.assemble():
+            print(line)
 
 
 if __name__ == '__main__':

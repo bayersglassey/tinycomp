@@ -42,6 +42,7 @@ main:
 D= callstack
 A= _prompt CALL printline
 CALL readline
+hello:
 A= _hello CALL printline
 A= readline_buf CALL printline
 IO= "!"
