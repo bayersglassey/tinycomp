@@ -449,12 +449,14 @@ class TinyMemory:
         self.values = [0] * size
         self.vtypes = [VT_RAW] * size
         self.changes = set()
+        self.accesses = set()
 
     def __eq__(self, other):
         return self.values == other.values and self.vtypes == other.vtypes
 
-    def reset_changes(self):
+    def reset_changes_and_accesses(self):
         self.changes.clear()
+        self.accesses.clear()
 
     def write_values(self, i, values, vtypes):
         size = len(values)
@@ -463,7 +465,7 @@ class TinyMemory:
         for value, vtype in zip(values, vtypes):
             self.set(i, value, vtype)
             i += VT_SIZE[vtype]
-        self.changes.clear()
+        self.reset_changes_and_accesses()
 
     def write_asm(self, i, result: AsmResult):
         return self.write_values(i, result.values, result.vtypes)
@@ -517,17 +519,22 @@ class TinyMemory:
             self.vtypes[i] = vtype
         return self
 
-    def get(self, i):
+    def get(self, i, **kwargs):
         vtype = self.vtypes[i]
         if VT_SIZE[vtype] == 2:
-            return self.get16(i)
+            return self.get16(i, **kwargs)
         else:
-            return self.get8(i)
+            return self.get8(i, **kwargs)
 
-    def get8(self, i):
+    def get8(self, i, quiet=False):
+        if not quiet:
+            self.accesses.add(i)
         return self.values[i], self.vtypes[i]
 
-    def get16(self, i):
+    def get16(self, i, quiet=False):
+        if not quiet:
+            self.accesses.add(i)
+            self.accesses.add(i + 1)
         vtype = self.vtypes[i]
         value = self.values[i] * 256 + self.values[i + 1]
         if vtype == VT_NUM:
@@ -560,6 +567,7 @@ class TinyMemory:
         self.vtypes[i] = vtype
         self.vtypes[i + 1] = VT_RAW
         self.changes.add(i)
+        self.changes.add(i + 1)
 
     def setstr(self, i, s):
         for c in s:
@@ -568,14 +576,14 @@ class TinyMemory:
             i += 1
 
     def dump(self, *,
-            i=0,
             w=16,
             h=None,
             ansi=True,
             file=None,
             bars=False,
             raw=False,
-            highlight_changes=True,
+            rows=None,
+            highlight_accesses=True,
             extra_highlights=(),
             ):
         space = '|' if bars else ' '
@@ -583,7 +591,7 @@ class TinyMemory:
 
         def print_value_str(j, value_str):
             if ansi:
-                if highlight_changes and j in self.changes:
+                if highlight_accesses and (j in self.accesses or j in self.changes):
                     value_str = f'{ANSI_HIGHLIGHT}{value_str}'
                 if j in extra_highlights:
                     value_str = f'{ANSI_INVERT}{value_str}'
@@ -591,10 +599,18 @@ class TinyMemory:
 
         skip = 0
         print(hbar, file=file)
+        printed_ellipses = False
         for y in count() if h is None else range(h):
-            y_ptr = i + y * w
+            y_ptr = y * w
             if y_ptr >= self.size:
                 break
+            if rows is not None and y not in rows:
+                if not printed_ellipses:
+                    print(' ...', file=file)
+                    printed_ellipses = True
+                continue
+            else:
+                printed_ellipses = False
             y_ptr_s = value_dump(y_ptr, VT_PTR, ansi=ansi).replace('&', '')
             print(f'{y_ptr_s} |', end='', file=file)
             for x in range(w):
@@ -619,7 +635,7 @@ class TinyMemory:
                     value = self.values[j]
                     vtype = VT_RAW
                 else:
-                    value, vtype = self.get(j)
+                    value, vtype = self.get(j, quiet=True)
                 value_str = value_dump(value, vtype, ansi=ansi, just=True)
                 print_value_str(j, value_str)
                 vsize = VT_SIZE[vtype]
@@ -695,8 +711,8 @@ class TinyProcessor:
     def add_breakpoint(self, i):
         self.breakpoints.add(i)
 
-    def reset_changes(self):
-        self.mem.reset_changes()
+    def reset_changes_and_accesses(self):
+        self.mem.reset_changes_and_accesses()
         for reg in REGISTERS:
             self.reg_changes[reg] = False
 
@@ -715,7 +731,7 @@ class TinyProcessor:
         print(f'CMP={self.cmp_flag}', file=file)
 
     def step(self):
-        self.reset_changes()
+        self.reset_changes_and_accesses()
         pc_value, pc_vtype = self.mem.get16(self.pc)
         if pc_value >= len(INSTRUCTIONS):
             self.halted = True
@@ -883,6 +899,8 @@ def parse_cli_args():
     parser.add_argument('--quiet', '-q', default=False, action='store_true')
     parser.add_argument('-b', '--bkpt', nargs='+',
         help="List of breakpoints, either decimal numbers, hex numbers with '0x' prefix, or ASM label names")
+    parser.add_argument('-H', '--highlights', nargs='+',
+        help="List of ASM label names; those sections of memory are kept permanently highlighted")
     return parser.parse_args()
 
 
@@ -918,10 +936,36 @@ def main(args=None):
         except Exception as ex:
             raise Exception(f"Couldn't set breakpoint {bkpt!r}: {ex}")
 
+    highlight_rows = set()
+    for hlight in args.highlights or ():
+        try:
+            if hlight not in asm.labels:
+                raise Exception(f"Label {hlight!r} not found. Available are: {', '.join(asm.labels)}")
+            ptr = asm.labels[hlight]
+            label_i = list(asm.labels).index(hlight)
+            if label_i < len(asm.labels) - 1:
+                end = list(asm.labels.values())[label_i + 1]
+            else:
+                end = mem.size
+            for i in range(ptr, end):
+                highlight_rows.add(i // 16)
+        except Exception as ex:
+            raise Exception(f"Couldn't set highlight {hlight!r}: {ex}")
+
     mem_dump_kwargs = dict(ansi=args.ansi, bars=args.bars, raw=args.raw)
     def dump():
         if proc is not None:
-            proc.dump_mem(**mem_dump_kwargs)
+            if proc.stepping:
+                dump_rows = highlight_rows.copy()
+                def _add_row(y, buffer=1):
+                    for i in range(y - buffer, y + buffer + 1):
+                        dump_rows.add(i)
+                _add_row(proc.pc // 16)
+                for i in proc.mem.accesses:
+                    _add_row(i // 16)
+            else:
+                dump_rows = None
+            proc.dump_mem(rows=dump_rows, **mem_dump_kwargs)
             proc.dump_registers(ansi=args.ansi)
             if args.labels and asm.labels:
                 print("labels:")
