@@ -144,6 +144,16 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         d
         !
 
+        >>> result = parse_asm('''
+        ...     %define x 2
+        ...     %define y ( x + 1 )
+        ...     %define z ( y * ( 10 + 1 ) )
+        ...     z
+        ... ''')
+        >>> for val, vt in zip(result.values, result.vtypes):
+        ...     print(value_dump(val, vt, ansi=False))
+        33
+
     """
     if result is None:
         values = []
@@ -158,9 +168,9 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
     def push(value, vtype):
         values.append(value)
         vtypes.append(vtype)
-    def get_ptr():
+    def get_ptr() -> int:
         return vsize_sum(vtypes)
-    def resolve_token(token):
+    def resolve_token(token) -> str:
         while token in definitions:
             token = definitions[token]
         if token in labels:
@@ -173,6 +183,24 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
             for i in replacements[label]:
                 values[i] = ptr
             del replacements[label]
+    def resolve_token_expr(tokens) -> str:
+        token = next(tokens)
+        if token == '(':
+            lhs_token = resolve_token_expr(tokens)
+            lhs = int(lhs_token)
+            while True:
+                token = next(tokens)
+                if token in BINOP_ACTIONS:
+                    op_action = BINOP_ACTIONS[token]
+                    rhs_token = resolve_token_expr(tokens)
+                    rhs = int(rhs_token)
+                    lhs = op_action(lhs, rhs)
+                elif token == ')':
+                    return str(lhs)
+                else:
+                    raise Exception(f"Expected ')' or a numerical operator")
+        else:
+            return resolve_token(token)
     for line_i, line in enumerate(text.splitlines()):
         token = None
         def get_tokens():
@@ -197,7 +225,7 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
                     name = next(tokens)
                     if name in definitions:
                         raise Exception(f"Redefinition of {name!r}")
-                    definitions[name] = resolve_token(next(tokens))
+                    definitions[name] = resolve_token_expr(tokens)
                 elif token == '%macro':
                     # Create a macro
                     name = next(tokens)
@@ -206,7 +234,7 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
                     macros[name] = list(tokens) # consume rest of line
                 elif token == '%zeros':
                     # Push some number of NUL bytes
-                    size_token = resolve_token(next(tokens))
+                    size_token = resolve_token_expr(tokens)
                     if not size_token.isdigit():
                         raise Exception(f"Not a valid size: {size_token!r}")
                     size = int(size_token)
