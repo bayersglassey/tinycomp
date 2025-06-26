@@ -148,12 +148,12 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         >>> result = parse_asm('''
         ...     %define x 2
         ...     %define y ( x + 1 )
-        ...     %define z ( y * ( 10 + 1 ) )
+        ...     %define z ( - y * ( 10 + 1 ) )
         ...     z
         ... ''')
         >>> for val, vt in zip(result.values, result.vtypes):
         ...     print(value_dump(val, vt, ansi=False))
-        33
+        -33
 
     """
     if result is None:
@@ -184,11 +184,17 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
             for i in replacements[label]:
                 values[i] = ptr
             del replacements[label]
-    def resolve_token_expr(tokens) -> str:
-        token = next(tokens)
+    def resolve_token_expr(tokens, token=None) -> str:
+        if token is None:
+            token = next(tokens)
         if token == '(':
-            lhs_token = resolve_token_expr(tokens)
-            lhs = int(lhs_token)
+            lhs_token = next(tokens)
+            if lhs_token == '-':
+                lhs_token = resolve_token_expr(tokens)
+                lhs = -int(lhs_token)
+            else:
+                lhs_token = resolve_token_expr(tokens, lhs_token)
+                lhs = int(lhs_token)
             while True:
                 token = next(tokens)
                 if token in BINOP_ACTIONS:
@@ -216,8 +222,8 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         try:
             for token in tokens:
 
-                # Resolve any definition references
-                token = resolve_token(token)
+                # Resolve any definition references, expressions, etc
+                token = resolve_token_expr(tokens, token)
 
                 if token in INSTRUCTIONS:
                     push(INSTRUCTIONS.index(token), VT_INST)
@@ -314,7 +320,7 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
                 else:
                     raise Exception(f"Cannot parse: {token!r}")
         except Exception as ex:
-            msg = f"Parsing token {token!r} at line {line_i + 1}: {ex}"
+            msg = f"Parsing token {token!r} at line {line_i + 1} (remaining tokens: {list(tokens)}): {ex}"
             if filename:
                 msg = f"In {filename}: {msg}"
             raise TinyAsmParseError(msg)
