@@ -36,6 +36,7 @@ VT_NAME = {
     VT_CHR:  'chr',
     VT_PTR:  'ptr',
 }
+VTYPES_BY_NAME = {v: k for k, v in VT_NAME.items()}
 
 VT_SIZE = {
     VT_RAW:  1,
@@ -108,7 +109,7 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         ...
         ...     %define x 2
         ...     %define y x
-        ...     %zeros y
+        ...     %zeros raw y
         ...
         ...     %macro values 100 -99 0xFF &0xff "hello world!"
         ...     data: values
@@ -233,13 +234,17 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
                         raise Exception(f"Redefinition of macro {name!r}")
                     macros[name] = list(tokens) # consume rest of line
                 elif token == '%zeros':
-                    # Push some number of NUL bytes
-                    size_token = resolve_token_expr(tokens)
-                    if not size_token.isdigit():
-                        raise Exception(f"Not a valid size: {size_token!r}")
-                    size = int(size_token)
-                    for i in range(size):
-                        push(0, VT_RAW)
+                    # Push some number of zeros
+                    vt_name = next(tokens)
+                    if vt_name not in VTYPES_BY_NAME:
+                        raise Exception(f"Expected one of: {', '.join(VTYPES_BY_NAME)}")
+                    vtype = VTYPES_BY_NAME[vt_name]
+                    number_token = resolve_token_expr(tokens)
+                    if not number_token.isdigit():
+                        raise Exception(f"Not a valid number: {number_token!r}")
+                    number = int(number_token)
+                    for i in range(number):
+                        push(0, vtype)
                 elif token == '%include':
                     # Include another ASM file
                     sub_filename = next(tokens)
@@ -323,6 +328,9 @@ def value_dump(value, vtype, *, ansi=True, just=False) -> str:
         s = hex(value)[2:].rjust(2, '0')
     elif vtype == VT_INST:
         s = inst_repr(value)
+        if s is None:
+            # RUH ROH
+            s = '----'
     elif vtype == VT_NUM:
         s = str(value)
     elif vtype == VT_CHR:

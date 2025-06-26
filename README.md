@@ -13,8 +13,8 @@ $ cat test.asm
 JMP main
 
 "STK:"
-%define callstack_size 10
-callstack: %zeros callstack_size
+%define callstack_size 5
+callstack: %zeros ptr callstack_size
 %macro CALL :D=PC :D+ 10 JMP
 %macro RET PC=:D
 
@@ -31,7 +31,7 @@ RET
 
 "RL:"
 %define readline_buf_size 50
-readline_buf: %zeros readline_buf_size
+readline_buf: %zeros chr readline_buf_size
 readline_buf_end:
 readline:
 A= readline_buf
@@ -54,6 +54,7 @@ main:
 D= callstack
 A= _prompt CALL printline
 CALL readline
+hello:
 A= _hello CALL printline
 A= readline_buf CALL printline
 IO= "!"
@@ -69,12 +70,12 @@ $ python tinycomp.py -f test.asm --bars -r
 What is your name? the world
 Hello, the world!
      +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-0000 |  JMP|&0082| S| T| K| :|&00ba|00|00|00|00|00|00|
-0010 |00|00| P| L| :|  .A?|\0|   JE|&0024|IO=.A|  A+1|
+0000 |  JMP|&0082| S| T| K| :|&00ba|&0000|&0000|&0000|
+0010 |&0000| P| L| :|  .A?|\0|   JE|&0024|IO=.A|  A+1|
 0020 |  JMP|&0015|PC=:D| R| L| :| t| h| e|  | w| o| r|
-0030 | l| d|\0|00|00|00|00|00|00|00|00|00|00|00|00|00|
-0040 |00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|00|
-0050 |00|00|00|00|00|00|00|00|00|00|00|   A=|&0029|.A=IO|
+0030 | l| d|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|
+0040 |\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|
+0050 |\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|\0|   A=|&0029|.A=IO|
 0060 |<<|  .A?|\n|   JE|&0076|  A+1|   A?|&005b|  JGE|
 0070 |&007b|  JMP|&005f|  .A=|\0|PC=:D| HALT| M| A| I|
 0080 | N| :|   D=|&0008|   A=|&00c2|:D=PC|  :D+|   10|

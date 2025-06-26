@@ -1,8 +1,8 @@
 JMP main
 
 "STK:"
-%define callstack_size 10
-callstack: %zeros callstack_size
+%define callstack_size 5
+callstack: %zeros ptr callstack_size
 %macro CALL :D=PC :D+ 10 JMP
 %macro RET PC=:D
 
@@ -19,7 +19,7 @@ RET
 
 "RL:"
 %define readline_buf_size 50
-readline_buf: %zeros readline_buf_size
+readline_buf: %zeros chr readline_buf_size
 readline_buf_end:
 readline:
 A= readline_buf
