@@ -1042,11 +1042,18 @@ def main(args=None):
         proc.set_dump(dump)
 
     if args.run:
-        proc.run()
+        try:
+            proc.run()
+        except Exception:
+            print(" *** ERROR WHILE PROCESSING ***")
+            dump()
+            raise
 
     if not args.quiet:
         dump()
 
+    return 0
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
