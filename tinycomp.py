@@ -155,6 +155,17 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         ...     print(value_dump(val, vt, ansi=False))
         -33
 
+        >>> result = parse_asm('''
+        ...     "hi"
+        ...     start: start ( start + 16 )
+        ... ''')
+        >>> for val, vt in zip(result.values, result.vtypes):
+        ...     print(value_dump(val, vt, ansi=False))
+        h
+        i
+        &0002
+        &0012
+
     """
     if result is None:
         values = []
@@ -188,13 +199,19 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
         if token is None:
             token = next(tokens)
         if token == '(':
+            # Do basic integer math & return a token which is an
+            # integer or pointer literal
             lhs_token = next(tokens)
             if lhs_token == '-':
                 lhs_token = resolve_token_expr(tokens)
-                lhs = -int(lhs_token)
+                neg = True
             else:
                 lhs_token = resolve_token_expr(tokens, lhs_token)
-                lhs = int(lhs_token)
+                neg = False
+            is_ptr = lhs_token.startswith('&')
+            lhs = int(lhs_token[1:], 16) if is_ptr else int(lhs_token)
+            if neg:
+                lhs = -lhs
             while True:
                 token = next(tokens)
                 if token in BINOP_ACTIONS:
@@ -203,9 +220,10 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
                     rhs = int(rhs_token)
                     lhs = op_action(lhs, rhs)
                 elif token == ')':
-                    return str(lhs)
+                    break
                 else:
                     raise Exception(f"Expected ')' or a numerical operator")
+            return f'&{hex(lhs)}' if is_ptr else str(lhs)
         else:
             return resolve_token(token)
     for line_i, line in enumerate(text.splitlines()):
