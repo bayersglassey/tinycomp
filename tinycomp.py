@@ -1,10 +1,11 @@
 import re
 import sys
 import operator
+import logging
 from itertools import count
 from argparse import ArgumentParser
 from collections import defaultdict
-from typing import List, Tuple, Dict, NamedTuple
+from typing import List, Set, Tuple, Dict, NamedTuple
 
 MAX_I16 = 32767
 
@@ -344,6 +345,12 @@ def parse_asm(text: str, filename=None, *, result: AsmResult = None) -> AsmResul
             raise TinyAsmParseError(msg)
     if replacements:
         raise Exception(f"Labels left undefined: {', '.join(replacements)}")
+
+    # Delete any remaining "private" labels
+    ll = [l for l in labels if l.startswith('_')]
+    for l in ll:
+        del labels[l]
+
     return result
 
 def value_dump(value, vtype, *, ansi=True, just=False) -> str:
@@ -404,7 +411,7 @@ LARGS = ('PC', 'IO', '.', ':') + tuple(
     for register in REGISTERS
     for prefix in ('', '.', ':'))
 RARGS = LARGS + ('', '0', '1', '2')
-CHAR_ARGS = ('IO',) + tuple(f'.{reg}' for reg in REGISTERS)
+CHAR_ARGS = ('IO', '.') + tuple(f'.{reg}' for reg in REGISTERS)
 BINOP_REGEX = re.compile(
     f"({'|'.join(re.escape(arg) for arg in LARGS)})"
     + f"({'|'.join(re.escape(op) for op in BINOPS)})"
@@ -716,9 +723,13 @@ class TinyProcessor:
 
     """
 
-    def __init__(self, mem: TinyMemory, *, term: TinyTerminal = None):
+    def __init__(self, mem: TinyMemory, *,
+            term: TinyTerminal = None,
+            labels: Dict[str, int] = None,
+            ):
         self.mem = mem
         self.term = term or TinyTerminal()
+        self.labels = labels or {}
 
         self.halted = False
         self.stepping = False
@@ -731,6 +742,27 @@ class TinyProcessor:
 
         self.pc = 0
         self.cmp_flag = 0
+
+    def get_highlight_rows(self, highlights, w=16) -> Set[int]:
+        labels = self.labels
+        label_names = list(labels)
+        label_values = list(labels.values())
+        rows = set()
+        for highlight in highlights:
+            if highlight not in labels:
+                raise Exception(f"Label {highlight!r} not found. Available are: {', '.join(labels)}")
+            try:
+                ptr = labels[highlight]
+                label_i = label_names.index(highlight)
+                if label_i < len(labels) - 1:
+                    end = label_values[label_i + 1]
+                else:
+                    end = mem.size
+                for i in range(ptr, end):
+                    rows.add(i // w)
+            except Exception as ex:
+                raise Exception(f"Couldn't set highlight {highlight!r}: {ex}")
+        return rows
 
     def add_breakpoint(self, i):
         self.breakpoints.add(i)
@@ -757,6 +789,8 @@ class TinyProcessor:
     def step(self):
         self.reset_changes_and_accesses()
         pc_value, pc_vtype = self.mem.get16(self.pc)
+        if pc_vtype != VT_INST:
+            raise Exception(f"PC is of unexpected type: {VT_NAME[pc_vtype]}")
         if pc_value >= len(INSTRUCTIONS):
             self.halted = True
             return
@@ -787,12 +821,16 @@ class TinyProcessor:
             self.pc += 2
             arg_size = 1 if larg in CHAR_ARGS else 2
             def get_arg_param(arg):
-                if arg in ('', '.', ':'):
+                if arg == '':
                     if arg_size == 2:
                         ret = self.mem.get16(self.pc)
                     else:
                         ret = self.mem.get8(self.pc)
                     self.pc += arg_size
+                    return ret
+                elif arg in '.:':
+                    ret = self.mem.get16(self.pc)
+                    self.pc += 2
                     return ret
                 else:
                     return None, None
@@ -802,7 +840,7 @@ class TinyProcessor:
                 # Avoid getting the lvalue's old value, which in particular
                 # avoids calling self.term.getch() when larg is 'IO'.
                 lvalue = 0
-                ltype = VT_RAW
+                lvtype = VT_RAW
             else:
                 lvalue, lvtype = self._get_arg(larg, lparam, lpvtype, old_pc)
             rvalue, rvtype = self._get_arg(rarg, rparam, rpvtype, old_pc)
@@ -815,7 +853,13 @@ class TinyProcessor:
                     self.cmp_flag = 0
             else:
                 value = BINOP_ACTIONS[op](lvalue, rvalue)
-                vtype = rvtype if op == '=' else lvtype
+                if op == '=':
+                    vtype = rvtype
+                else:
+                    n_nums = (lvtype == VT_NUM) + (rvtype == VT_NUM)
+                    if n_nums < 1:
+                        raise Exception(f"Mixing non-numeric types: {VT_NAME[lvtype]} {op} {VT_NAME[rvtype]}")
+                    vtype = lvtype if rvtype == VT_NUM else rvtype
                 self._set_arg(larg, lparam, lpvtype, value, vtype)
 
     def set_dump(self, dump=None):
@@ -841,20 +885,29 @@ class TinyProcessor:
                         prev_cmd = cmd
                     else:
                         cmd = prev_cmd
-                    for c in cmd:
-                        if c == 'd':
-                            self.dump()
-                        elif c == 'c':
-                            self.stepping = False
-                            prev_cmd = ''
-                        elif c == 'h':
-                            print("Debug mode commands:")
-                            print(" h: help (show this message)")
-                            print(" d: dump/display memory & registers")
-                            print(" n: execute next instruction")
-                            print(" c: continue execution (exit debug mode)")
-                        elif c in ('n', ''):
-                            self.step()
+                    if cmd.startswith('d '):
+                        label_names = cmd.split()[1:]
+                        try:
+                            highlight_rows = self.get_highlight_rows(label_names)
+                            self.mem.dump(rows=highlight_rows)
+                        except Exception:
+                            logging.exception(f"Error dumping: {label_names}")
+                    else:
+                        for c in cmd:
+                            if c == 'd':
+                                self.dump()
+                            elif c == 'c':
+                                self.stepping = False
+                                prev_cmd = ''
+                            elif c == 'h':
+                                print("Debug mode commands:")
+                                print(" h: help (show this message)")
+                                print(" d: dump/display memory & registers")
+                                print(" n: execute next instruction")
+                                print(" c: continue execution (exit debug mode)")
+                                print("NOTE: hit enter without typing a command to repeat previous command.")
+                            elif c == 'n':
+                                self.step()
             else:
                 if self.halted:
                     break
@@ -945,7 +998,7 @@ def main(args=None):
         asm = parse_asm(file.read(), filename)
         file.close()
         mem = TinyMemory.load_asm(asm, args.size)
-        proc = TinyProcessor(mem)
+        proc = TinyProcessor(mem, labels=asm.labels)
     for bkpt in args.bkpt or ():
         try:
             if bkpt.isdigit():
@@ -953,47 +1006,35 @@ def main(args=None):
             elif bkpt.startswith('0x'):
                 bkpt = int(bkpt[2:], 16)
             else:
-                if bkpt not in asm.labels:
-                    raise Exception(f"Label {bkpt!r} not found. Available are: {', '.join(asm.labels)}")
-                bkpt = asm.labels[bkpt]
+                if bkpt not in proc.labels:
+                    raise Exception(f"Label {bkpt!r} not found. Available are: {', '.join(proc.labels)}")
+                bkpt = proc.labels[bkpt]
             proc.add_breakpoint(bkpt)
         except Exception as ex:
             raise Exception(f"Couldn't set breakpoint {bkpt!r}: {ex}")
 
-    highlight_rows = set()
-    for hlight in args.highlights or ():
-        try:
-            if hlight not in asm.labels:
-                raise Exception(f"Label {hlight!r} not found. Available are: {', '.join(asm.labels)}")
-            ptr = asm.labels[hlight]
-            label_i = list(asm.labels).index(hlight)
-            if label_i < len(asm.labels) - 1:
-                end = list(asm.labels.values())[label_i + 1]
-            else:
-                end = mem.size
-            for i in range(ptr, end):
-                highlight_rows.add(i // 16)
-        except Exception as ex:
-            raise Exception(f"Couldn't set highlight {hlight!r}: {ex}")
+    highlight_rows = proc.get_highlight_rows(args.highlights or ())
 
     mem_dump_kwargs = dict(ansi=args.ansi, bars=args.bars, raw=args.raw)
-    def dump():
+    def dump(w=16):
         if proc is not None:
             if proc.stepping:
                 dump_rows = highlight_rows.copy()
                 def _add_row(y, buffer=1):
                     for i in range(y - buffer, y + buffer + 1):
                         dump_rows.add(i)
-                _add_row(proc.pc // 16)
+                _add_row(proc.pc // w)
                 for i in proc.mem.accesses:
-                    _add_row(i // 16)
+                    _add_row(i // w)
+                for i in proc.mem.changes:
+                    _add_row(i // w)
             else:
                 dump_rows = None
             proc.dump_mem(rows=dump_rows, **mem_dump_kwargs)
             proc.dump_registers(ansi=args.ansi)
-            if args.labels and asm.labels:
+            if args.labels and proc.labels:
                 print("labels:")
-                for name, ptr in asm.labels.items():
+                for name, ptr in proc.labels.items():
                     print(f"  {name}={value_dump(ptr, VT_PTR, ansi=args.ansi)}")
         else:
             mem.dump(**mem_dump_kwargs)
